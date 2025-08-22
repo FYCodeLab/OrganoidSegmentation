@@ -1,0 +1,7 @@
+streamlit>=1.37
+torch==2.2.2             # CPU wheel
+torchvision==0.17.2      # if you actually use it; else remove
+numpy
+pillow
+pandas
+opencv-python-headless
