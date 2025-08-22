@@ -1,47 +1,49 @@
 # streamlit_app.py
 import os, io, time, tempfile
-from pathlib import Path
 from typing import Optional
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2
 import streamlit as st
 
-# ── Hard requirement: PyTorch must be installed (compatible with Python 3.13)
+# ──────────────────────────────────────────────────────────────────────────────
+# Hard requirements and environment setup
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     import torch
+    import torch.nn as nn
     import torch.nn.functional as F
-except Exception as e:
+except Exception:
     st.error(
         "PyTorch failed to import. Ensure requirements.txt pins a Python-3.13 compatible version, "
-        "for example: torch==2.5.1 (and torchvision==0.20.1 only if you actually import it)."
+        "for example: torch==2.5.1 (and torchvision==0.20.1 only if you import it)."
     )
     st.stop()
 
-# ── External downloader
 try:
     import gdown
 except Exception:
     st.error("Missing dependency 'gdown'. Add `gdown>=5` to requirements.txt.")
     st.stop()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App config
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Organoid Segmentation – Web Uploader (CPU)", layout="wide")
-st.title("Organoid Segmentation – Web Uploader (CPU)")
-
-# Force CPU/threading constraints suitable for Streamlit Cloud
+# CPU-only for Streamlit Community Cloud
 os.environ["OMP_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 DEVICE = "cpu"
 
+# Default pixel size (µm/pixel), user can change in sidebar
+ORIGINAL_PIXEL_SIZE_UM = 1.41
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Model download & load (Google Drive)
+# Streamlit page config
 # ──────────────────────────────────────────────────────────────────────────────
-# Replace only this block if you move the model elsewhere
+st.set_page_config(page_title="Organoid Segmentation – Web Uploader (CPU)", layout="wide")
+st.title("Organoid Segmentation – Web Uploader (CPU)")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Google Drive model download
+# ──────────────────────────────────────────────────────────────────────────────
 FILE_ID = "1ExZa5GLlRHdRermgnssqV7-TlqmUr0I5"
 DRIVE_VIEW_URL = f"https://drive.google.com/file/d/{FILE_ID}/view"
 DRIVE_DIRECT_URL = f"https://drive.google.com/uc?id={FILE_ID}"
@@ -49,52 +51,187 @@ DRIVE_DIRECT_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 @st.cache_resource(show_spinner=False)
 def _download_model_to_tmp() -> str:
     """
-    Downloads the model from Google Drive to a temp file (cached across reruns).
-    Returns the local file path.
+    Download the model from Google Drive into a temp file, cached across reruns.
     """
     target = os.path.join(tempfile.gettempdir(), "organoid_model.pt")
     if not os.path.exists(target) or os.path.getsize(target) == 0:
-        # Visible status to the user: we are downloading from Google Drive
         with st.status("Downloading model from Google Drive…", expanded=True) as status:
             st.write(f"Source: {DRIVE_VIEW_URL}")
             gdown.download(DRIVE_DIRECT_URL, target, quiet=False)
-            # Basic sanity check
             if not os.path.exists(target) or os.path.getsize(target) == 0:
                 status.update(label="Download failed.", state="error")
                 raise RuntimeError("Model download failed or produced empty file.")
             status.update(label="Model downloaded.", state="complete")
     return target
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Attention U-Net reconstruction (to load a state_dict)
+# ──────────────────────────────────────────────────────────────────────────────
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.double_conv(x)
+
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels),
+        )
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+class AttentionBlock(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        # g: decoder feature (gate), x: encoder skip feature
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=False):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels)
+        else:
+            # transposed conv expects half the in_channels because of concatenation
+            self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+        # attention acts on skip and gate features; here we align dimensions using out_channels
+        self.attention = AttentionBlock(F_g=out_channels, F_l=out_channels, F_int=out_channels // 2)
+
+    def forward(self, x1, x2):
+        # x1: decoder feature, x2: encoder skip
+        x1 = self.up(x1)
+        # pad to handle odd shapes
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        # attention refine on skip
+        x2 = self.attention(x1, x2)
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    def forward(self, x):
+        return self.conv(x)
+
+class UNet(nn.Module):
+    """U-Net with Attention Gates (default: 3→1 channels)"""
+    def __init__(self, n_channels=3, n_classes=1, bilinear=False):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(512, 1024 // factor)
+        self.up1 = Up(1024, 512 // factor, bilinear)
+        self.up2 = Up(512, 256 // factor, bilinear)
+        self.up3 = Up(256, 128 // factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x,  x3)
+        x = self.up3(x,  x2)
+        x = self.up4(x,  x1)
+        return self.outc(x)
+
+def _build_exact_model() -> nn.Module:
+    # Adjust if your training used different channels/classes/bilinear
+    return UNet(n_channels=3, n_classes=1, bilinear=False)
+
 @st.cache_resource(show_spinner=True)
 def load_model() -> "torch.nn.Module":
     """
-    Loads the PyTorch model (CPU) from the downloaded file and returns it in eval mode.
+    Load either a state_dict or a fully serialized model, and return it in eval mode (CPU).
     """
     local_path = _download_model_to_tmp()
-    # If you saved a full module: torch.load(local_path, map_location="cpu")
-    # If you saved a state_dict: you must reconstruct your model class and call load_state_dict.
-    model = torch.load(local_path, map_location="cpu")
-    model.eval()
+    checkpoint = torch.load(local_path, map_location="cpu")
+
+    # If it is a state_dict (OrderedDict of parameter tensors)
+    if isinstance(checkpoint, dict) and not hasattr(checkpoint, "forward"):
+        model = _build_exact_model()
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+        if missing or unexpected:
+            st.warning(f"State dict loaded with key differences. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            if missing:
+                st.write(missing[:10])
+            if unexpected:
+                st.write(unexpected[:10])
+        model.eval()
+        return model
+
+    # Else assume it is a full serialized model object
+    model = checkpoint
+    if hasattr(model, "to"):
+        model.to("cpu")
+    if hasattr(model, "eval"):
+        model.eval()
     return model
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Inference utilities (adapt these to your model’s I/O if needed)
+# Pre/post-processing helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
     arr = np.array(img.convert("RGB"))
-    t = torch.from_numpy(arr).float() / 255.0  # [0,1]
-    return t.permute(2, 0, 1).unsqueeze(0)     # 1,3,H,W
+    t = torch.from_numpy(arr).float() / 255.0
+    return t.permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
 
 def tensor_to_mask(prob: torch.Tensor, threshold: float = 0.5) -> np.ndarray:
     """
-    Supports either (1,1,H,W) -> sigmoid binary, or (1,C,H,W) -> softmax multi-class.
-    Modify if your model’s output format differs.
+    Binary: (1,1,H,W) via sigmoid threshold.
+    Multi-class: (1,C,H,W) via softmax argmax.
     """
     if prob.ndim == 4 and prob.shape[1] == 1:
         probs = torch.sigmoid(prob)[0, 0].cpu().numpy()
         return (probs >= threshold).astype(np.uint8)
     elif prob.ndim == 4 and prob.shape[1] > 1:
-        probs = F.softmax(prob, dim=1)[0]                  # C,H,W
+        probs = F.softmax(prob, dim=1)[0]
         return probs.argmax(0).cpu().numpy().astype(np.uint8)
     raise ValueError(f"Unexpected model output shape: {tuple(prob.shape)}")
 
@@ -103,7 +240,7 @@ def overlay_mask_on_image(image: np.ndarray, mask: np.ndarray, alpha: float = 0.
     if mask.ndim != 2:
         raise ValueError("Mask must be 2D (H,W).")
     mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    # Binary: green overlay for 1s; extend if multi-class with a palette.
+    # Binary mask overlay in green
     mask_vis[mask == 1] = (0, 255, 0)
     return cv2.addWeighted(image, 1.0, mask_vis, alpha, 0.0)
 
@@ -125,15 +262,16 @@ def predict_mask(model, img: Image.Image, threshold: float) -> np.ndarray:
 st.sidebar.header("Settings")
 st.sidebar.info(f"Model source: Google Drive\n\n{DRIVE_VIEW_URL}")
 threshold = st.sidebar.slider("Mask threshold (binary models)", 0.0, 1.0, 0.5, 0.01)
-pixel_size_um = st.sidebar.number_input("Pixel size (µm/pixel, optional)", value=0.0, min_value=0.0, step=0.01)
+pixel_size_um = st.sidebar.number_input(
+    "Pixel size (µm/pixel)", value=float(ORIGINAL_PIXEL_SIZE_UM), min_value=0.0, step=0.01
+)
 gallery_cols = st.sidebar.slider("Gallery columns", 2, 6, 4)
 redownload = st.sidebar.button("Force re-download model")
 
 if redownload:
-    # Clear caches for a fresh download/load
+    # Clear caches and file to force a fresh download
     _download_model_to_tmp.clear()
     load_model.clear()
-    # Remove old file to guarantee re-fetch
     try:
         old = os.path.join(tempfile.gettempdir(), "organoid_model.pt")
         if os.path.exists(old):
@@ -143,18 +281,18 @@ if redownload:
     st.experimental_rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Uploader + processing
+# Main UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown(
     "Upload one or more images. The app will segment each image, display a gallery, "
-    "and produce a per-image metrics table (CSV downloadable)."
+    "and produce a per-image metrics table that you can download as CSV."
 )
 
 files = st.file_uploader(
     "Upload images (PNG/JPG/TIF)", type=["png", "jpg", "jpeg", "tif", "tiff"], accept_multiple_files=True
 )
 
-# Load model (with visible status message)
+# Load model with visible status
 with st.status("Preparing model (CPU)…", expanded=True) as s:
     s.write("Loading from Google Drive cache and initializing weights on CPU.")
     model = load_model()
@@ -216,4 +354,4 @@ if results:
     )
 
 st.markdown("---")
-st.caption("Notes: CPU-only. Model is fetched from Google Drive and cached. Update the FILE_ID to change the model.")
+st.caption("CPU-only. Model is downloaded from Google Drive and cached. Update FILE_ID to change the model.")
