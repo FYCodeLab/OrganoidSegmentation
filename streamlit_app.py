@@ -1,182 +1,190 @@
-# app.py
-import os
-import io
-import time
+# streamlit_app.py
+import os, io, time, tempfile
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import List, Tuple
-
-import torch
-import torch.nn.functional as F
 from PIL import Image
 import cv2
-
 import streamlit as st
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Organoid Segmentation", layout="wide")
+# ── Hard requirement: PyTorch must be installed (compatible with Python 3.13)
+try:
+    import torch
+    import torch.nn.functional as F
+except Exception as e:
+    st.error(
+        "PyTorch failed to import. Ensure requirements.txt pins a Python-3.13 compatible version, "
+        "for example: torch==2.5.1 (and torchvision==0.20.1 only if you actually import it)."
+    )
+    st.stop()
+
+# ── External downloader
+try:
+    import gdown
+except Exception:
+    st.error("Missing dependency 'gdown'. Add `gdown>=5` to requirements.txt.")
+    st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utility functions
+# App config
 # ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Organoid Segmentation – Web Uploader (CPU)", layout="wide")
+st.title("Organoid Segmentation – Web Uploader (CPU)")
+
+# Force CPU/threading constraints suitable for Streamlit Cloud
+os.environ["OMP_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+DEVICE = "cpu"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model download & load (Google Drive)
+# ──────────────────────────────────────────────────────────────────────────────
+# Replace only this block if you move the model elsewhere
+FILE_ID = "1ExZa5GLlRHdRermgnssqV7-TlqmUr0I5"
+DRIVE_VIEW_URL = f"https://drive.google.com/file/d/{FILE_ID}/view"
+DRIVE_DIRECT_URL = f"https://drive.google.com/uc?id={FILE_ID}"
+
 @st.cache_resource(show_spinner=False)
-def load_model(model_path: str, device: str = "cpu"):
+def _download_model_to_tmp() -> str:
     """
-    Load a PyTorch segmentation model.
-    Adjust this to match how you saved your model.
+    Downloads the model from Google Drive to a temp file (cached across reruns).
+    Returns the local file path.
     """
-    mdl = torch.load(model_path, map_location=device)
-    mdl.eval()
-    return mdl, device
+    target = os.path.join(tempfile.gettempdir(), "organoid_model.pt")
+    if not os.path.exists(target) or os.path.getsize(target) == 0:
+        # Visible status to the user: we are downloading from Google Drive
+        with st.status("Downloading model from Google Drive…", expanded=True) as status:
+            st.write(f"Source: {DRIVE_VIEW_URL}")
+            gdown.download(DRIVE_DIRECT_URL, target, quiet=False)
+            # Basic sanity check
+            if not os.path.exists(target) or os.path.getsize(target) == 0:
+                status.update(label="Download failed.", state="error")
+                raise RuntimeError("Model download failed or produced empty file.")
+            status.update(label="Model downloaded.", state="complete")
+    return target
 
+@st.cache_resource(show_spinner=True)
+def load_model() -> "torch.nn.Module":
+    """
+    Loads the PyTorch model (CPU) from the downloaded file and returns it in eval mode.
+    """
+    local_path = _download_model_to_tmp()
+    # If you saved a full module: torch.load(local_path, map_location="cpu")
+    # If you saved a state_dict: you must reconstruct your model class and call load_state_dict.
+    model = torch.load(local_path, map_location="cpu")
+    model.eval()
+    return model
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Inference utilities (adapt these to your model’s I/O if needed)
+# ──────────────────────────────────────────────────────────────────────────────
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    arr = np.array(img.convert("RGB"))  # H, W, 3
+    arr = np.array(img.convert("RGB"))
     t = torch.from_numpy(arr).float() / 255.0  # [0,1]
-    t = t.permute(2, 0, 1).unsqueeze(0)        # 1,3,H,W
-    return t
+    return t.permute(2, 0, 1).unsqueeze(0)     # 1,3,H,W
 
 def tensor_to_mask(prob: torch.Tensor, threshold: float = 0.5) -> np.ndarray:
     """
-    Convert model output to a binary mask. 
-    Modify this if your model outputs multi-class masks:
-    - For multi-class (C,H,W) logits: mask = probs.argmax(0)
-    - For sigmoid map: mask = (prob > threshold)
+    Supports either (1,1,H,W) -> sigmoid binary, or (1,C,H,W) -> softmax multi-class.
+    Modify if your model’s output format differs.
     """
     if prob.ndim == 4 and prob.shape[1] == 1:
-        # shape: 1,1,H,W (sigmoid)
         probs = torch.sigmoid(prob)[0, 0].cpu().numpy()
-        mask = (probs >= threshold).astype(np.uint8)
+        return (probs >= threshold).astype(np.uint8)
     elif prob.ndim == 4 and prob.shape[1] > 1:
-        # softmax multi-class
-        probs = F.softmax(prob, dim=1)[0]                    # C,H,W
-        mask = probs.argmax(0).cpu().numpy().astype(np.uint8)  # 0..C-1
-    else:
-        raise ValueError("Unexpected model output shape")
-    return mask
+        probs = F.softmax(prob, dim=1)[0]                  # C,H,W
+        return probs.argmax(0).cpu().numpy().astype(np.uint8)
+    raise ValueError(f"Unexpected model output shape: {tuple(prob.shape)}")
 
 def overlay_mask_on_image(image: np.ndarray, mask: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    """
-    Overlay a binary or multi-class mask on an RGB image.
-    For multi-class masks, each class is given a distinct color.
-    """
     h, w, _ = image.shape
-    if mask.ndim == 2:
-        mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
-        # binary: color = green
-        mask_vis[mask == 1] = (0, 255, 0)
-    else:
-        raise ValueError("Mask must be 2D (H,W)")
+    if mask.ndim != 2:
+        raise ValueError("Mask must be 2D (H,W).")
+    mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    # Binary: green overlay for 1s; extend if multi-class with a palette.
+    mask_vis[mask == 1] = (0, 255, 0)
+    return cv2.addWeighted(image, 1.0, mask_vis, alpha, 0.0)
 
-    blended = cv2.addWeighted(image, 1.0, mask_vis, alpha, 0.0)
-    return blended
-
-def compute_basic_stats(mask: np.ndarray, pixel_size_um: float | None = None) -> dict:
-    """
-    Extract simple, useful metrics.
-    - area_px: number of mask pixels == 1
-    - area_um2 (optional): area in µm² if pixel size is provided
-    - components: number of connected components
-    """
+def compute_basic_stats(mask: np.ndarray, pixel_size_um: Optional[float]) -> dict:
     area_px = int(mask.sum())
-    if pixel_size_um is not None:
-        area_um2 = float(area_px * (pixel_size_um ** 2))
-    else:
-        area_um2 = None
+    area_um2 = float(area_px * (pixel_size_um ** 2)) if pixel_size_um else None
+    nlab, _ = cv2.connectedComponents(mask.astype(np.uint8))
+    return {"area_px": area_px, "area_um2": area_um2, "components": int(nlab - 1)}
 
-    # Connected components (binary)
-    num_labels, _ = cv2.connectedComponents(mask.astype(np.uint8))
-    components = int(num_labels - 1)  # exclude background
-
-    return {
-        "area_px": area_px,
-        "area_um2": area_um2,
-        "components": components,
-    }
-
-def predict_mask(model, device: str, img: Image.Image):
-    """
-    Run the model on the image and return a 2D mask (H,W).
-    Modify to match your model’s expected input pipeline.
-    """
+def predict_mask(model, img: Image.Image, threshold: float) -> np.ndarray:
     with torch.no_grad():
-        t = pil_to_tensor(img).to(device)
-        out = model(t)            # expected shapes: (1,1,H,W) or (1,C,H,W)
-    mask = tensor_to_mask(out)
-    return mask
+        t = pil_to_tensor(img).to(DEVICE)
+        out = model(t)
+    return tensor_to_mask(out, threshold=threshold)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sidebar controls
 # ──────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("Settings")
-model_path = st.sidebar.text_input(
-    "Model path (.pt or .pth)", 
-    value="/content/drive/MyDrive/Segmenting_Brain_Organoids/organoid_segmentation_model_pytorch_attention.pt"
-)
-device_choice = st.sidebar.selectbox("Device", ["cpu", "cuda"], index=0)
-threshold = st.sidebar.slider("Mask threshold (if binary)", 0.0, 1.0, 0.5, 0.01)
-pixel_size_um = st.sidebar.number_input("Pixel size (µm/pixel) – optional", value=0.0, min_value=0.0, step=0.01)
+st.sidebar.info(f"Model source: Google Drive\n\n{DRIVE_VIEW_URL}")
+threshold = st.sidebar.slider("Mask threshold (binary models)", 0.0, 1.0, 0.5, 0.01)
+pixel_size_um = st.sidebar.number_input("Pixel size (µm/pixel, optional)", value=0.0, min_value=0.0, step=0.01)
 gallery_cols = st.sidebar.slider("Gallery columns", 2, 6, 4)
+redownload = st.sidebar.button("Force re-download model")
+
+if redownload:
+    # Clear caches for a fresh download/load
+    _download_model_to_tmp.clear()
+    load_model.clear()
+    # Remove old file to guarantee re-fetch
+    try:
+        old = os.path.join(tempfile.gettempdir(), "organoid_model.pt")
+        if os.path.exists(old):
+            os.remove(old)
+    except Exception:
+        pass
+    st.experimental_rerun()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main UI
+# Uploader + processing
 # ──────────────────────────────────────────────────────────────────────────────
-st.title("Organoid Segmentation – Web Uploader")
-
 st.markdown(
-    """
-    Upload one or more images. The app will segment each image, show a gallery, 
-    and generate a metrics table you can download as CSV.
-    """
+    "Upload one or more images. The app will segment each image, display a gallery, "
+    "and produce a per-image metrics table (CSV downloadable)."
 )
 
-# File uploader
 files = st.file_uploader(
     "Upload images (PNG/JPG/TIF)", type=["png", "jpg", "jpeg", "tif", "tiff"], accept_multiple_files=True
 )
 
-# Load model only when needed
-model = None
-if files and model_path:
-    if not os.path.exists(model_path):
-        st.error("Model file not found. Please check the path in the sidebar.")
-    else:
-        # safety if user chooses cuda but it is unavailable
-        device = "cuda" if (device_choice == "cuda" and torch.cuda.is_available()) else "cpu"
-        model, device = load_model(model_path, device)
-        st.success(f"Model loaded on {device.upper()}")
+# Load model (with visible status message)
+with st.status("Preparing model (CPU)…", expanded=True) as s:
+    s.write("Loading from Google Drive cache and initializing weights on CPU.")
+    model = load_model()
+    s.update(label="Model ready.", state="complete")
 
-# Process
 results = []
 if files and model is not None:
     st.subheader("Results")
-    start_all = time.time()
-
-    # Gallery
     cols = st.columns(gallery_cols, gap="small")
     i = 0
+    t_all = time.time()
+
+    px_size = pixel_size_um if pixel_size_um > 0 else None
 
     for up in files:
-        # Read
         image_bytes = up.read()
         pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img_np = np.array(pil)
 
-        # Predict
         t0 = time.time()
-        mask = predict_mask(model, device, pil)
-        runtime_s = time.time() - t0
+        try:
+            mask = predict_mask(model, pil, threshold)
+        except Exception as e:
+            st.error(f"Inference failed for {up.name}: {e}")
+            continue
+        dt = time.time() - t0
 
-        # Postprocess + overlay
         overlay = overlay_mask_on_image(img_np, mask, alpha=0.45)
+        stats = compute_basic_stats(mask, px_size)
 
-        # Compute stats
-        px_size = pixel_size_um if pixel_size_um > 0 else None
-        stats = compute_basic_stats(mask, pixel_size_um=px_size)
-
-        # Save into results
         row = {
             "filename": up.name,
             "height_px": img_np.shape[0],
@@ -184,34 +192,28 @@ if files and model is not None:
             "area_px": stats["area_px"],
             "area_um2": stats["area_um2"],
             "components": stats["components"],
-            "runtime_s": round(runtime_s, 4),
+            "runtime_s": round(dt, 4),
         }
         results.append(row)
 
-        # Show images side-by-side: original and overlay
         with cols[i % gallery_cols]:
             st.caption(up.name)
             st.image(img_np, caption="Original", use_column_width=True)
             st.image(overlay, caption="Segmentation overlay", use_column_width=True)
         i += 1
 
-    total_time = time.time() - start_all
-    st.info(f"Processed {len(files)} image(s) in {total_time:.2f} s")
+    st.info(f"Processed {len(results)} image(s) in {time.time() - t_all:.2f} s")
 
-# Metrics table + download
 if results:
     st.subheader("Per-image metrics")
     df = pd.DataFrame(results)
     st.dataframe(df, use_container_width=True)
-
-    csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download CSV", data=csv, file_name="segmentation_metrics.csv", mime="text/csv"
+        "Download CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="segmentation_metrics.csv",
+        mime="text/csv",
     )
 
-# Footer
 st.markdown("---")
-st.markdown(
-    "Tip: if your model outputs multi-class masks, change `tensor_to_mask` and `overlay_mask_on_image` "
-    "to use `argmax` and a color palette."
-)
+st.caption("Notes: CPU-only. Model is fetched from Google Drive and cached. Update the FILE_ID to change the model.")
