@@ -1,7 +1,9 @@
-streamlit>=1.37
-torch==2.2.2             # CPU wheel
-torchvision==0.17.2      # if you actually use it; else remove
+streamlit==1.48.1
+torch==2.5.1
+torchvision==0.20.1
 numpy
 pillow
 pandas
 opencv-python-headless
+huggingface-hub>=0.23
+gdown>=5
